@@ -1,8 +1,8 @@
-name: sonarqube
+name: sonarcloud
 
 on:
   push:
-    branches: [master]
+    branches: [master, main]
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
@@ -16,16 +16,16 @@ permissions:
   pull-requests: read
 
 jobs:
-  sonarqube:
-    name: Análise SonarQube
+  sonarcloud:
+    name: Análise SonarCloud
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # histórico completo: necessário para blame e new code
+          fetch-depth: 0 # histórico completo, necessário para o Sonar
 
       - name: Setup Flutter (inclui Dart)
         uses: subosito/flutter-action@v2
@@ -33,36 +33,100 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Instalar ferramentas
+      - name: Ferramenta de cobertura para pacotes Dart
         run: dart pub global activate coverage
+
+      # Resolve as dependências de TODOS os pacotes (inclusive os sem testes) antes da
+      # análise. Sem isso o analisador Dart não encontra os pacotes importados e gera
+      # milhares de erros "Undefined name/class" (regra dart:S2260).
+      - name: Resolver dependências de todos os pacotes
+        run: |
+          set -uo pipefail
+          ok=0; failed=0
+          : > "$RUNNER_TEMP/pub_failed.txt"
+
+          while IFS= read -r pubspec; do
+            pkg="$(dirname "$pubspec")"
+            echo "::group::pub get em $pkg"
+            if (cd "$pkg" && flutter pub get); then
+              ok=$((ok+1))
+            else
+              failed=$((failed+1))
+              echo "$pkg" >> "$RUNNER_TEMP/pub_failed.txt"
+              echo "::warning::pub get falhou em $pkg"
+            fi
+            echo "::endgroup::"
+          done < <(find packages -name pubspec.yaml \
+                     -not -path "*/.dart_tool/*" \
+                     -not -path "*/build/*" \
+                     -not -path "*/ephemeral/*" \
+                     -not -path "*/.symlinks/*" \
+                     -not -path "*/node_modules/*" -not -path "*/example/*" | sort)
+
+          {
+            echo "### Resolução de dependências"
+            echo "- Pacotes resolvidos: $ok"
+            echo "- Pacotes com falha: $failed"
+            if [ "$failed" -gt 0 ]; then
+              echo ""; echo "Sem dependências resolvidas (a análise deles terá ruído):"; echo '```'
+              cat "$RUNNER_TEMP/pub_failed.txt"; echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Resolvidos: $ok | Falharam: $failed"
 
       - name: Testes com cobertura (todos os pacotes)
         run: |
-          set -euo pipefail
-          for pkg in packages/*/; do
-            [ -f "$pkg/pubspec.yaml" ] || continue
-            [ -d "$pkg/test" ] || { echo "Sem testes em $pkg"; continue; }
+          set -uo pipefail
+          export PATH="$PATH:$HOME/.pub-cache/bin"
+          mkdir -p coverage
+          : > coverage/lcov.info
+
+          while IFS= read -r pubspec; do
+            pkg="$(dirname "$pubspec")"
+            [ -d "$pkg/test" ] || continue
+
             echo "::group::$pkg"
-            pushd "$pkg" > /dev/null
-            if grep -q "sdk: flutter" pubspec.yaml; then
-              flutter pub get
-              flutter test --coverage
-            else
-              dart pub get
-              dart test --coverage=coverage
-              dart pub global run coverage:format_coverage \
-                --lcov --in=coverage --out=coverage/lcov.info \
-                --report-on=lib --packages=.dart_tool/package_config.json
+            (
+              cd "$pkg"
+              if grep -q "sdk: flutter" pubspec.yaml; then
+                flutter test --coverage
+              else
+                dart test --coverage=coverage
+                dart pub global run coverage:format_coverage \
+                  --lcov --in=coverage --out=coverage/lcov.info \
+                  --report-on=lib --packages=.dart_tool/package_config.json
+              fi
+            ) || echo "::warning::Falha nos testes de $pkg"
+
+            # Caminhos (SF:) relativos à raiz do repositório
+            if [ -f "$pkg/coverage/lcov.info" ]; then
+              sed "s|^SF:|SF:${pkg#./}/|" "$pkg/coverage/lcov.info" >> coverage/lcov.info
             fi
-            popd > /dev/null
             echo "::endgroup::"
-          done
-        continue-on-error: true # a análise roda mesmo se algum teste falhar
+          done < <(find packages -name pubspec.yaml \
+                     -not -path "*/.dart_tool/*" \
+                     -not -path "*/build/*" \
+                     -not -path "*/ephemeral/*" \
+                     -not -path "*/.symlinks/*" \
+                     -not -path "*/node_modules/*" -not -path "*/example/*" | sort)
 
       - name: SonarCloud Scan
         uses: SonarSource/sonarqube-scan-action@v5
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.host.url=https://sonarcloud.io
+            -Dsonar.organization=anamgholanda
+            -Dsonar.projectKey=anamgholanda_bloc
+            -Dsonar.projectName=bloc
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.sources=packages
+            -Dsonar.inclusions=packages/**/lib/**/*.dart
+            -Dsonar.exclusions=**/example/**,**/*.g.dart,**/*.freezed.dart,**/generated/**,**/.dart_tool/**,**/build/**,**/ephemeral/**
+            -Dsonar.tests=packages
+            -Dsonar.test.inclusions=packages/**/test/**/*.dart
+            -Dsonar.dart.lcov.reportPaths=coverage/lcov.info
 
       - name: Quality Gate
         uses: SonarSource/sonarqube-quality-gate-action@v1
