@@ -1,3 +1,11 @@
+# 0.4.3
+
+- deps: adjust bounds for `_fe_analyzer_shared`
+
+# 0.4.2
+
+- deps: adjust bounds for `_fe_analyzer_shared`
+
 # 0.4.1
 
 - deps: adjust upper bound for `_fe_analyzer_shared`
